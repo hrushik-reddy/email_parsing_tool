@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 import os
 import tempfile
+import time
 from typing import Dict, Any, Optional, List, Tuple
 from io import BytesIO
 from openai import AzureOpenAI
@@ -41,15 +42,26 @@ def interact_with_azure_gpt(system_prompt: str,
     start_time = datetime.now()
     
     try:
+        # Check if this is a GPT-5 model first
+        is_gpt5 = 'gpt-5' in deployment_name.lower()
+        
+        # Adjust timeout significantly for GPT-5 models (research shows they need 45s+ vs 20s for GPT-4)
+        if is_gpt5:
+            timeout = max(timeout * 6, 180)  # At least 3 minutes for GPT-5
+            print(f"[DEBUG] GPT-5 detected: Using extended timeout = {timeout} seconds")
+        else:
+            print(f"[DEBUG] GPT-4 model: Using standard timeout = {timeout} seconds")
+        
         # Initialize Azure OpenAI client
+        # Use a newer API version for better GPT-5 support
+        api_version = '2025-04-01-preview' if is_gpt5 else os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview')
+        
         client = AzureOpenAI(
             api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview'),
-            azure_endpoint=os.getenv('AZURE_OPENAI_API_BASE')
+            api_version=api_version,
+            azure_endpoint=os.getenv('AZURE_OPENAI_API_BASE'),
+            timeout=timeout  # Apply the adjusted timeout to the client
         )
-        
-        # Check if this is a GPT-5 model
-        is_gpt5 = 'gpt-5' in deployment_name.lower()
         
         # Adjust temperature for GPT-5 models
         if is_gpt5:
@@ -68,15 +80,103 @@ def interact_with_azure_gpt(system_prompt: str,
         
         # Use max_completion_tokens for GPT-5, max_tokens for others
         if is_gpt5:
-            api_params["max_completion_tokens"] = max_tokens
+            # GPT-5 needs much higher token limits - increase significantly
+            max_tokens_adjusted = max(max_tokens * 3, 4000)  # At least 3x or 4000 tokens
+            api_params["max_completion_tokens"] = max_tokens_adjusted
+            print(f"[DEBUG] GPT-5 detected: Using max_completion_tokens = {max_tokens_adjusted} (original: {max_tokens})")
         else:
             api_params["max_tokens"] = max_tokens
+            print(f"[DEBUG] GPT-4 model: Using max_tokens = {max_tokens}")
         
-        # Call Azure OpenAI API with deployment name
-        response = client.chat.completions.create(**api_params)
+        # Debug: Print API parameters
+        print(f"[DEBUG] API params: {api_params}")
         
-        # Extract response content
-        content = response.choices[0].message.content.strip()
+        # Implement retry logic for GPT-5 models due to their higher latency
+        max_retries = 3 if is_gpt5 else 1
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    wait_time = 2 ** attempt  # Exponential backoff: 2s, 4s, 8s
+                    print(f"[DEBUG] Retry attempt {attempt + 1}/{max_retries} after {wait_time}s wait...")
+                    time.sleep(wait_time)
+                
+                # Call Azure OpenAI API with deployment name
+                response = client.chat.completions.create(**api_params)
+                break  # Success, exit retry loop
+                
+            except Exception as api_error:
+                if "timeout" in str(api_error).lower() or "timed out" in str(api_error).lower():
+                    print(f"[DEBUG] Timeout on attempt {attempt + 1}: {api_error}")
+                    if attempt == max_retries - 1:  # Last attempt
+                        raise api_error
+                    continue  # Retry
+                else:
+                    # Non-timeout error, don't retry
+                    raise api_error
+        
+        # Debug logging for troubleshooting
+        print(f"[DEBUG] Model: {deployment_name}")
+        print(f"[DEBUG] Response choices length: {len(response.choices)}")
+        print(f"[DEBUG] Response choice 0 message: {response.choices[0].message}")
+        print(f"[DEBUG] Raw content type: {type(response.choices[0].message.content)}")
+        print(f"[DEBUG] Raw content repr: {repr(response.choices[0].message.content)}")
+        
+        # Check finish reason for potential issues
+        finish_reason = response.choices[0].finish_reason
+        print(f"[DEBUG] Finish reason: {finish_reason}")
+        
+        # Handle content filtering issues
+        if finish_reason == 'content_filter':
+            return {
+                'success': False,
+                'content': None,
+                'model_used': deployment_name,
+                'tokens_used': response.usage.total_tokens if response.usage else 0,
+                'execution_time': (datetime.now() - start_time).total_seconds(),
+                'timestamp': datetime.now().isoformat(),
+                'error': f"Content was filtered by Azure's content filtering system for model {deployment_name}."
+            }
+        
+        # Handle length limit issues (common with GPT-5)
+        if finish_reason == 'length':
+            return {
+                'success': False,
+                'content': None,
+                'model_used': deployment_name,
+                'tokens_used': response.usage.total_tokens if response.usage else 0,
+                'execution_time': (datetime.now() - start_time).total_seconds(),
+                'timestamp': datetime.now().isoformat(),
+                'error': f"Model {deployment_name} hit token limit. Input too long or max_tokens too small. Current tokens used: {response.usage.total_tokens if response.usage else 'unknown'}. Try reducing input size or increasing max_tokens."
+            }
+        
+        # Extract response content with proper null checking
+        raw_content = response.choices[0].message.content
+        
+        # Handle cases where content might be None or empty
+        if raw_content is None:
+            return {
+                'success': False,
+                'content': None,
+                'model_used': deployment_name,
+                'tokens_used': response.usage.total_tokens if response.usage else 0,
+                'execution_time': (datetime.now() - start_time).total_seconds(),
+                'timestamp': datetime.now().isoformat(),
+                'error': f"Model {deployment_name} returned null content. This might be due to content filtering or model configuration issues."
+            }
+        
+        content = raw_content.strip()
+        
+        # Additional check for empty content after stripping
+        if not content:
+            return {
+                'success': False,
+                'content': '',
+                'model_used': deployment_name,
+                'tokens_used': response.usage.total_tokens if response.usage else 0,
+                'execution_time': (datetime.now() - start_time).total_seconds(),
+                'timestamp': datetime.now().isoformat(),
+                'error': f"Model {deployment_name} returned empty content after processing. Check input length, content filtering settings, or model parameters."
+            }
         
         # Calculate execution time
         execution_time = (datetime.now() - start_time).total_seconds()
@@ -275,24 +375,31 @@ def main():
             "Model",
             list(model_options.keys()),
             label_visibility="collapsed",
-            help="GPT-4o: Balanced performance | GPT-5: Latest capabilities (temp=1.0) | Mini versions: Faster & cheaper"
+            help="GPT-4o: Balanced performance | GPT-5: Latest capabilities but slower (1-3 min response time) | Mini versions: Faster & cheaper"
         )
         model_choice = model_options[model_display]
         
         # Show temperature info for GPT-5 models
         if 'GPT-5' in model_display:
-            st.info("ℹ️ GPT-5 models use temperature=1.0 and max_completion_tokens parameter")
+            st.info("ℹ️ GPT-5 models use temperature=1.0, max_completion_tokens parameter, and take 1-3 minutes to respond")
         
         # Advanced settings - initialize with default
         max_tokens_input = 1000
         with st.expander("Advanced Settings"):
+            # Set higher default for GPT-5 models
+            if 'GPT-5' in model_display:
+                default_max_tokens = 4000
+                help_text = "GPT-5 models typically need higher token limits. Recommended: 4000+"
+            else:
+                default_max_tokens = 1000
+                help_text = "Maximum number of tokens to generate in the response"
+                
             max_tokens_input = st.slider(
                 "Max Tokens",
                 min_value=100,
-                max_value=4000,
-                value=1000,
-                step=100,
-                help="Maximum tokens for response generation"
+                max_value=8000,
+                value=default_max_tokens,
+                help=help_text
             )
         
         # System prompt
@@ -342,6 +449,10 @@ Focus especially on the critical columns: Past 24 Hour Sales, Amz in stock?, Tit
                         # Set temperature based on model type
                         temp = 1.0 if 'gpt-5' in model_choice.lower() else 0.3
                         
+                        # Show different spinner message for GPT-5 models
+                        if 'gpt-5' in model_choice.lower():
+                            st.info("⏱️ GPT-5 models take longer to process (1-3 minutes). Please wait...")
+                        
                         result = interact_with_azure_gpt(
                             system_prompt=system_prompt,
                             user_prompt=full_user_prompt,
@@ -354,7 +465,12 @@ Focus especially on the critical columns: Past 24 Hour Sales, Amz in stock?, Tit
                         if result['success']:
                             st.session_state.ai_response = result['content']
                         else:
-                            st.session_state.ai_response = f"❌ Error: {result.get('error', 'Unknown error')}"
+                            # Provide specific guidance for timeout errors
+                            error_msg = result.get('error', 'Unknown error')
+                            if 'timeout' in error_msg.lower() or 'timed out' in error_msg.lower():
+                                st.session_state.ai_response = f"❌ Timeout Error: {error_msg}\n\n💡 **Suggestions:**\n- GPT-5 models need more time - this is normal\n- Try reducing your input text length\n- Increase max tokens in Advanced Settings\n- Consider using GPT-4o for faster responses"
+                            else:
+                                st.session_state.ai_response = f"❌ Error: {error_msg}"
                     
                     st.success(f"✅ Analysis complete using {model_display}!")
                     
