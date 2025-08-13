@@ -531,7 +531,7 @@ Focus especially on the critical columns: Past 24 Hour Sales, Amz in stock?, Tit
             # Display AI response
             with st.container():
                 st.markdown(
-                    f"""<div style="height: 300px; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; border-radius: 5px; background-color: #f8f9fa;">
+                    f"""<div style="height: 300px; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; border-radius: 5px;">
                     {st.session_state.ai_response}
                     </div>""",
                     unsafe_allow_html=True
