@@ -204,8 +204,11 @@ def interact_with_azure_gpt(system_prompt: str,
 
 # ============== EML PARSING FUNCTIONS ==============
 def extract_body_content(msg):
-    """Extract body content from email message."""
-    body_content = ""
+    """Extract body content from email message, prioritizing HTML table extraction."""
+    import base64
+    
+    html_content = ""
+    plain_content = ""
     
     if msg.is_multipart():
         for part in msg.walk():
@@ -216,24 +219,161 @@ def extract_body_content(msg):
                 continue
             
             if content_type == "text/plain":
-                body_content = part.get_payload(decode=True).decode(errors='ignore')
-                break
-            elif content_type == "text/html" and not body_content:
+                plain_content = part.get_payload(decode=True).decode(errors='ignore')
+            elif content_type == "text/html":
                 html_content = part.get_payload(decode=True).decode(errors='ignore')
-                body_content = re.sub('<[^<]+?>', '', html_content)
     else:
-        body_content = msg.get_payload(decode=True).decode(errors='ignore')
+        # Handle single-part messages (could be base64 encoded)
+        content_type = msg.get_content_type()
+        transfer_encoding = msg.get('Content-Transfer-Encoding', '').lower()
+        
+        if transfer_encoding == 'base64':
+            # Base64 encoded content
+            try:
+                raw_payload = msg.get_payload()
+                # Remove whitespace and newlines from base64 string
+                clean_b64 = ''.join(raw_payload.split())
+                decoded_content = base64.b64decode(clean_b64).decode('utf-8', errors='ignore')
+                
+                if content_type == "text/html" or '<html' in decoded_content.lower() or '<table' in decoded_content.lower():
+                    html_content = decoded_content
+                else:
+                    plain_content = decoded_content
+            except Exception as e:
+                print(f"Error decoding base64 content: {e}")
+                # Fallback to regular decoding
+                content = msg.get_payload(decode=True).decode(errors='ignore')
+                if '<html' in content.lower():
+                    html_content = content
+                else:
+                    plain_content = content
+        else:
+            # Regular content
+            content = msg.get_payload(decode=True).decode(errors='ignore')
+            if '<html' in content.lower():
+                html_content = content
+            else:
+                plain_content = content
     
-    return body_content
+    # If we have HTML content, extract tables more intelligently
+    if html_content:
+        return extract_tables_from_html(html_content)
+    else:
+        return plain_content
 
-def detect_and_format_table(lines):
-    """Detect table structure and convert to markdown."""
-    table_data = []
-    headers = None
+def extract_tables_from_html(html_content):
+    """Extract table data from HTML content and convert to structured text."""
+    # Find table sections and their headers
+    extracted_text = []
+    
+    # Look for section headers that appear before tables
+    section_patterns = [
+        r'Movers\s*&\s*Shakers',
+        r'Top\s*100\s*Print',
+        r'Kindle',
+        r'Audible'
+    ]
+    
+    # Split content by table tags to process each table separately
+    table_matches = re.finditer(r'<table[^>]*>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
+    
+    for i, table_match in enumerate(table_matches):
+        table_html = table_match.group(1)
+        
+        # Find section header before this table
+        section_header = f"Table {i+1}"
+        start_pos = max(0, table_match.start() - 1000)  # Look back 1000 chars
+        preceding_text = html_content[start_pos:table_match.start()]
+        
+        # Look for section indicators
+        if 'Amazon Rank (AM)' in preceding_text:
+            section_header = "Amazon Rank (AM)"
+        elif 'Amazon Rank (PM)' in preceding_text:
+            section_header = "Amazon Rank (PM)"
+        elif 'Top 100 Print' in preceding_text:
+            section_header = "Top 100 Print"
+        elif 'Audible' in preceding_text:
+            section_header = "Audible"
+        elif 'Kindle' in preceding_text:
+            section_header = "Kindle"
+        
+        extracted_text.append(f"\n{section_header}\n")
+        
+        # Extract table headers
+        header_matches = re.findall(r'<th[^>]*>(.*?)</th>', table_html, re.DOTALL | re.IGNORECASE)
+        if header_matches:
+            headers = []
+            for header in header_matches:
+                # Remove HTML tags and clean up
+                clean_header = re.sub(r'<[^>]+>', '', header).strip()
+                clean_header = re.sub(r'\s+', ' ', clean_header)
+                if clean_header:
+                    headers.append(clean_header)
+            
+            if headers:
+                extracted_text.append('\t'.join(headers))
+        
+        # Extract table rows
+        row_matches = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL | re.IGNORECASE)
+        for row_html in row_matches:
+            # Skip header rows (they contain <th> tags)
+            if '<th' in row_html.lower():
+                continue
+                
+            # Extract cell data
+            cell_matches = re.findall(r'<td[^>]*>(.*?)</td>', row_html, re.DOTALL | re.IGNORECASE)
+            if cell_matches:
+                cells = []
+                for cell in cell_matches:
+                    # Remove HTML tags and clean up
+                    clean_cell = re.sub(r'<[^>]+>', '', cell).strip()
+                    clean_cell = re.sub(r'\s+', ' ', clean_cell)
+                    # Handle empty cells
+                    if not clean_cell:
+                        clean_cell = ""
+                    cells.append(clean_cell)
+                
+                if cells and any(cell.strip() for cell in cells):  # Skip empty rows
+                    extracted_text.append('\t'.join(cells))
+    
+    return '\n'.join(extracted_text)
+
+def detect_multiple_tables(lines):
+    """Detect multiple table structures and convert to markdown with section headers."""
+    tables = []
+    current_table_data = []
+    current_headers = None
+    current_section = None
+    
+    # Known section indicators for your reports
+    section_indicators = [
+        'Amazon Rank (AM)', 'Amazon Rank (PM)', 'Top 100 Print', 
+        'Kindle', 'Audible', 'Movers & Shakers'
+    ]
     
     for line in lines:
         line = line.strip()
         if not line:
+            continue
+        
+        # Check if this line indicates a new section
+        is_section_header = any(indicator in line for indicator in section_indicators)
+        if is_section_header:
+            # Save previous table if it exists
+            if current_headers and current_table_data:
+                table_markdown = build_markdown_table(current_headers, current_table_data)
+                if table_markdown:
+                    tables.append({
+                        'section': current_section or 'Unknown Section',
+                        'markdown': table_markdown,
+                        'headers': current_headers,
+                        'data': current_table_data
+                    })
+            
+            # Start new section
+            current_section = line
+            current_headers = None
+            current_table_data = []
             continue
         
         # Detect potential table rows
@@ -246,40 +386,70 @@ def detect_and_format_table(lines):
             else:
                 cells = [cell.strip() for cell in re.split(r'\s{2,}', line)]
             
-            # Filter out empty cells from the split
+            # Filter out empty cells
             cells = [cell for cell in cells if cell]
             
-            # First row with multiple cells becomes header
-            if not headers and len(cells) > 3:
-                headers = cells
-            elif headers:
-                table_data.append(cells)
+            # Skip lines that don't look like table data
+            if len(cells) < 2:
+                continue
+            
+            # Detect headers (lines with common table column names)
+            header_keywords = [
+                'rank', 'title', 'author', 'imprint', 'asin', 'isbn', 
+                'sales', 'stock', 'price', 'am', 'pm', 'promotion'
+            ]
+            
+            if not current_headers and len(cells) > 3:
+                # Check if this looks like a header row
+                is_header = any(any(keyword in cell.lower() for keyword in header_keywords) 
+                              for cell in cells)
+                if is_header:
+                    current_headers = cells
+                    continue
+            
+            # Add data row if we have headers
+            if current_headers and len(cells) >= 2:
+                current_table_data.append(cells)
     
-    # Build markdown table
-    if headers and table_data:
-        # Ensure all rows have same number of columns
-        max_cols = len(headers)
-        
-        markdown_lines = []
-        # Header
-        markdown_lines.append('| ' + ' | '.join(headers) + ' |')
-        # Separator
-        markdown_lines.append('|' + '|'.join([' --- ' for _ in range(max_cols)]) + '|')
-        # Data rows
-        for row in table_data:
-            # Pad row if needed
-            while len(row) < max_cols:
-                row.append('')
-            # Truncate if too many columns
-            row = row[:max_cols]
-            markdown_lines.append('| ' + ' | '.join(row) + ' |')
-        
-        return '\n'.join(markdown_lines), headers, table_data
+    # Don't forget the last table
+    if current_headers and current_table_data:
+        table_markdown = build_markdown_table(current_headers, current_table_data)
+        if table_markdown:
+            tables.append({
+                'section': current_section or 'Final Section',
+                'markdown': table_markdown,
+                'headers': current_headers,
+                'data': current_table_data
+            })
     
-    return None, None, None
+    return tables
 
-def parse_eml_content(eml_content: bytes) -> Tuple[str, dict, List, List]:
-    """Parse EML content and return markdown, metadata, headers, and table data."""
+def build_markdown_table(headers, table_data):
+    """Build a markdown table from headers and data."""
+    if not headers or not table_data:
+        return None
+    
+    max_cols = len(headers)
+    markdown_lines = []
+    
+    # Header
+    markdown_lines.append('| ' + ' | '.join(headers) + ' |')
+    # Separator
+    markdown_lines.append('|' + '|'.join([' --- ' for _ in range(max_cols)]) + '|')
+    
+    # Data rows
+    for row in table_data:
+        # Pad row if needed
+        while len(row) < max_cols:
+            row.append('')
+        # Truncate if too many columns
+        row = row[:max_cols]
+        markdown_lines.append('| ' + ' | '.join(row) + ' |')
+    
+    return '\n'.join(markdown_lines)
+
+def parse_eml_content(eml_content: bytes) -> Tuple[str, dict, List]:
+    """Parse EML content and return markdown, metadata, and tables data."""
     # Parse the .eml content
     msg = BytesParser(policy=policy.default).parse(BytesIO(eml_content))
     
@@ -305,29 +475,29 @@ def parse_eml_content(eml_content: bytes) -> Tuple[str, dict, List, List]:
     markdown_output.append("## Report Content\n")
     
     body_content = extract_body_content(msg)
-    
-    table_markdown = None
-    headers = None
-    table_data = None
+    tables = []
     
     if body_content:
         lines = body_content.split('\n')
         
-        # Look for table data
-        table_markdown, headers, table_data = detect_and_format_table(lines)
+        # Look for multiple tables
+        tables = detect_multiple_tables(lines)
         
-        if table_markdown:
-            markdown_output.append("### Data Table\n")
-            markdown_output.append(table_markdown)
+        if tables:
+            for i, table_info in enumerate(tables):
+                markdown_output.append(f"### {table_info['section']}\n")
+                markdown_output.append(table_info['markdown'])
+                markdown_output.append("\n")
         else:
-            # Add raw content if no table detected
+            # Add raw content if no tables detected
+            markdown_output.append("### Raw Content\n")
             for line in lines:
                 if line.strip():
                     markdown_output.append(line.strip())
     
     markdown_content = '\n'.join(markdown_output)
     
-    return markdown_content, metadata, headers, table_data
+    return markdown_content, metadata, tables
 
 # ============== STREAMLIT APP ==============
 def main():
@@ -403,14 +573,19 @@ def main():
             )
         
         # System prompt
-        default_system_prompt = """You are a data quality specialist for book sales reports. 
+        default_system_prompt = """You are a data quality specialist for analyzing email reports containing MULTIPLE SEPARATE TABLES.
 
-Analyze the provided book sales report and identify:
-1. Missing values in critical columns (Past 24 Hour Sales, Amz in stock?, Title, ISBN)
-2. Data quality issues
-3. Any anomalies or inconsistencies
+This report contains several distinct table sections (e.g., "Amazon Rank (AM)", "Amazon Rank (PM)", "Top 100 Print", "Kindle", "Audible"). 
+Analyze EACH TABLE SECTION INDIVIDUALLY and identify:
 
-Provide a concise analysis focusing on actionable insights."""
+1. **Per-Table Analysis**: For each table section, identify missing values in critical columns
+2. **Data Quality Issues**: Inconsistencies, formatting problems, or incomplete data within each table
+3. **Missing Table Sections**: Expected sections that are completely absent or empty
+4. **Cross-Table Comparison**: Compare data between different table sections to identify gaps
+5. **Section-Specific Issues**: Table sections with headers but no data rows
+6. **Critical Data Gaps**: Missing information in key columns like Sales, Stock Status, Title, ISBN
+
+Provide analysis organized BY TABLE SECTION with specific actionable insights for data completeness and quality."""
         
         system_prompt = st.text_area(
             "System Prompt",
@@ -420,9 +595,17 @@ Provide a concise analysis focusing on actionable insights."""
         )
         
         # User prompt
-        default_user_prompt = """Analyze this book sales report for missing values and data quality issues.
+        default_user_prompt = """Analyze this book sales report with MULTIPLE TABLE SECTIONS for missing values and data quality issues.
 
-Focus especially on the critical columns: Past 24 Hour Sales, Amz in stock?, Title, and ISBN."""
+The report should contain these sections:
+- Amazon Rank (AM) table
+- Amazon Rank (PM) table  
+- Top 100 Print table
+- Kindle table
+- Audible table
+
+For EACH table section, focus on critical columns: Past 24 Hour Sales, Amz in stock?, Title, and ISBN.
+Identify which sections are missing entirely and which have incomplete data."""
         
         user_prompt = st.text_area(
             "User Prompt",
@@ -438,9 +621,25 @@ Focus especially on the critical columns: Past 24 Hour Sales, Amz in stock?, Tit
                     # Read and parse EML
                     eml_content = uploaded_file.read()
                     with st.spinner("Parsing EML file..."):
-                        markdown_content, metadata, headers, table_data = parse_eml_content(eml_content)
+                        markdown_content, metadata, tables = parse_eml_content(eml_content)
                         st.session_state.markdown_content = markdown_content
                         st.session_state.file_uploaded = True
+                        
+                        # Save parsed markdown content to a text file for accuracy checking
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        output_filename = f"parsed_eml_{timestamp}.txt"
+                        try:
+                            with open(output_filename, 'w', encoding='utf-8') as f:
+                                f.write("="*50 + "\n")
+                                f.write("PARSED EML CONTENT - MARKDOWN FORMAT\n")
+                                f.write("="*50 + "\n\n")
+                                f.write(markdown_content)
+                                f.write("\n\n" + "="*50 + "\n")
+                                f.write("END OF PARSED CONTENT\n")
+                                f.write("="*50 + "\n")
+                            st.success(f"✅ Parsed content saved to: {output_filename}")
+                        except Exception as save_error:
+                            st.warning(f"⚠️ Could not save file: {save_error}")
                     
                     # Run AI analysis
                     with st.spinner("Running AI analysis..."):

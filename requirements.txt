@@ -1,4 +1,29 @@
-openai
-python-dotenv
-pandas
+# Core app dependencies
+openai==1.3.0
+python-dotenv==1.0.0
+pandas==2.1.3
 streamlit
+
+# API dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+pydantic==2.5.0
+
+# Email fetcher dependencies
+requests>=2.31.0
+schedule>=1.2.0
+
+# Gmail API dependencies
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+google-api-python-client>=2.100.0
+
+# Microsoft Graph API dependencies (optional)
+azure-identity>=1.14.0
+msgraph-sdk>=1.0.0
+msal>=1.24.0
+
+# Email handling
+email-validator>=2.0.0
