@@ -9,11 +9,8 @@
     "max_results": 10
   },
   "microsoft": {
-    "client_id": "",
-    "client_secret": "",
-    "tenant_id": "",
-    "mailbox": "user@company.com",
-    "search_query": "from:reports@company.com OR subject:(daily report)"
+    "client_id": "7a43ccdc-9772-429a-8e8d-9c80e141f732",
+    "max_results": 10
   },
   "schedule": {
     "time": "16:45",

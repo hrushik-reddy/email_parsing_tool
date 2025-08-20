@@ -15,6 +15,7 @@ from typing import List, Dict, Any, Optional
 import schedule
 import time
 import logging
+import asyncio
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import smtplib
@@ -31,6 +32,7 @@ try:
     import msal
     from msgraph import GraphServiceClient
     from azure.identity import ClientSecretCredential
+    from kiota_abstractions.base_request_configuration import RequestConfiguration
     MICROSOFT_AVAILABLE = True
 except ImportError:
     MICROSOFT_AVAILABLE = False
@@ -137,7 +139,7 @@ class EmailFetcher:
             return False
 
     def setup_microsoft_auth(self) -> bool:
-        """Setup Microsoft Graph API authentication"""
+        """Setup Microsoft Graph API authentication for personal accounts"""
         if not MICROSOFT_AVAILABLE:
             logger.warning("Microsoft Graph dependencies not available")
             return False
@@ -145,19 +147,23 @@ class EmailFetcher:
         try:
             ms_config = self.config['microsoft']
             
-            if not all([ms_config['client_id'], ms_config['client_secret'], ms_config['tenant_id']]):
-                logger.warning("Microsoft credentials not configured")
+            if not ms_config.get('client_id'):
+                logger.warning("Microsoft client_id not configured")
                 return False
             
-            credential = ClientSecretCredential(
-                tenant_id=ms_config['tenant_id'],
+            # For personal accounts, use interactive authentication
+            from azure.identity import InteractiveBrowserCredential
+            
+            # Use public client (no secret needed for delegated permissions)
+            credential = InteractiveBrowserCredential(
                 client_id=ms_config['client_id'],
-                client_secret=ms_config['client_secret']
+                tenant_id='consumers',  # Use 'consumers' for personal Microsoft accounts only
+                redirect_uri='http://localhost:8080'  # Local redirect for interactive auth
             )
             
             self.microsoft_client = GraphServiceClient(
                 credentials=credential,
-                scopes=['https://graph.microsoft.com/.default']
+                scopes=['https://graph.microsoft.com/Mail.Read']
             )
             
             logger.info("Microsoft Graph authentication successful")
@@ -237,7 +243,7 @@ class EmailFetcher:
             logger.error(f"Error fetching Gmail emails: {e}")
             return []
 
-    def fetch_microsoft_emails(self, hours_back: int = 24) -> List[Dict[str, Any]]:
+    async def fetch_microsoft_emails(self, hours_back: int = 24) -> List[Dict[str, Any]]:
         """Fetch emails from Microsoft Outlook"""
         if not self.microsoft_client:
             logger.error("Microsoft client not initialized")
@@ -250,18 +256,87 @@ class EmailFetcher:
             since_date = datetime.now() - timedelta(hours=hours_back)
             date_filter = since_date.isoformat() + 'Z'
             
-            # Build filter query
+            # Build filter query for recent emails
             filter_query = f"receivedDateTime ge {date_filter}"
-            search_query = ms_config.get('search_query', '')
             
-            # Note: This is a simplified implementation
-            # Full Microsoft Graph implementation would go here
-            logger.warning("Microsoft email fetching not fully implemented yet")
-            return []
+            # For delegated permissions, always use 'me' (current user)
+            mailbox = 'me'
+            
+            # Fetch messages using Microsoft Graph API
+            request_url = f"/users/{mailbox}/messages"
+            
+            # Use the Graph client to get messages
+            request_config = RequestConfiguration()
+            request_config.query_parameters = {
+                "$filter": filter_query,
+                "$top": ms_config.get('max_results', 10),
+                "$select": "id,subject,from,receivedDateTime,body"
+            }
+            
+            messages = await self.microsoft_client.users.by_user_id(mailbox).messages.get(request_configuration=request_config)
+            
+            emails = []
+            
+            if messages and messages.value:
+                for message in messages.value:
+                    try:
+                        # Get the full message with MIME content
+                        msg_request_config = RequestConfiguration()
+                        msg_request_config.query_parameters = {
+                            "$select": "id,subject,from,receivedDateTime,body,internetMessageHeaders"
+                        }
+                        
+                        full_message = await self.microsoft_client.users.by_user_id(mailbox).messages.by_message_id(message.id).get(request_configuration=msg_request_config)
+                        
+                        # Convert to EML format (simplified)
+                        raw_content = self.convert_outlook_to_eml(full_message)
+                        
+                        emails.append({
+                            'id': message.id,
+                            'raw_content': raw_content,
+                            'subject': message.subject or 'No Subject',
+                            'from': message.from_.email_address.address if message.from_ else 'Unknown',
+                            'date': message.received_date_time.isoformat() if message.received_date_time else 'Unknown',
+                            'source': 'outlook'
+                        })
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing Outlook message {message.id}: {e}")
+                        continue
+            
+            logger.info(f"Fetched {len(emails)} emails from Outlook")
+            return emails
             
         except Exception as e:
             logger.error(f"Error fetching Microsoft emails: {e}")
             return []
+    
+    def convert_outlook_to_eml(self, message) -> str:
+        """Convert Outlook message to EML format"""
+        try:
+            # Create basic EML structure
+            eml_lines = []
+            
+            # Headers
+            if message.from_:
+                eml_lines.append(f"From: {message.from_.email_address.address}")
+            if message.subject:
+                eml_lines.append(f"Subject: {message.subject}")
+            if message.received_date_time:
+                eml_lines.append(f"Date: {message.received_date_time.strftime('%a, %d %b %Y %H:%M:%S %z')}")
+            
+            eml_lines.append("Content-Type: text/html; charset=utf-8")
+            eml_lines.append("")  # Empty line between headers and body
+            
+            # Body
+            if message.body and message.body.content:
+                eml_lines.append(message.body.content)
+            
+            return '\n'.join(eml_lines)
+            
+        except Exception as e:
+            logger.error(f"Error converting message to EML: {e}")
+            return f"Subject: {getattr(message, 'subject', 'Error')}\n\nError converting message"
 
     def save_email_as_eml(self, email_data: Dict[str, Any], temp_dir: str) -> Optional[str]:
         """Save email content as .eml file"""
@@ -377,21 +452,21 @@ class EmailFetcher:
         except Exception as e:
             logger.error(f"Error sending notification: {e}")
 
-    def process_emails(self):
+    async def process_emails(self):
         """Main function to fetch and process emails"""
         logger.info("Starting email processing...")
         
         all_emails = []
         
-        # Fetch Gmail emails
-        if self.setup_gmail_auth():
-            gmail_emails = self.fetch_gmail_emails()
-            all_emails.extend(gmail_emails)
+        # Fetch Gmail emails (commented out)
+        # if self.setup_gmail_auth():
+        #     gmail_emails = self.fetch_gmail_emails()
+        #     all_emails.extend(gmail_emails)
         
-        # Fetch Microsoft emails (commented out for now)
-        # if self.setup_microsoft_auth():
-        #     microsoft_emails = self.fetch_microsoft_emails()
-        #     all_emails.extend(microsoft_emails)
+        # Fetch Microsoft emails
+        if self.setup_microsoft_auth():
+            microsoft_emails = await self.fetch_microsoft_emails()
+            all_emails.extend(microsoft_emails)
         
         if not all_emails:
             logger.info("No emails found to process")
@@ -442,7 +517,7 @@ class EmailFetcher:
         """Start the scheduled email processing"""
         schedule_time = self.config.get('schedule', {}).get('time', '16:45')
         
-        schedule.every().day.at(schedule_time).do(self.process_emails)
+        schedule.every().day.at(schedule_time).do(lambda: asyncio.run(self.process_emails()))
         
         logger.info(f"Scheduler started. Will run daily at {schedule_time}")
         logger.info("Press Ctrl+C to stop")
@@ -468,7 +543,7 @@ def main():
     
     if args.run_now:
         logger.info("Running email processing immediately...")
-        fetcher.process_emails()
+        asyncio.run(fetcher.process_emails())
     else:
         fetcher.start_scheduler()
 
